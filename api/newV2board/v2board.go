@@ -381,7 +381,7 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 func (c *APIClient) ReportNodeStatus(nodeStatus *api.NodeStatus) (err error) {
     // 【关键修复】按照Xboard的/status接口期望的格式构建数据
     // 注意：Xboard期望的是具体的字节数，不是百分比
-    estimatedMemTotal := int64(4 * 1024 * 1024 * 1024)   // 4 GB
+    estimatedMemTotal := int64(2 * 1024 * 1024 * 1024)   // 2 GB
     estimatedDiskTotal := int64(40 * 1024 * 1024 * 1024) // 40 GB
     
     statusData := map[string]interface{}{
