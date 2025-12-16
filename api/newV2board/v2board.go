@@ -1,0 +1,666 @@
+package newV2board
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+	 "sync" // 新增，用于支持 APIClient 中的互斥锁 (sync.Mutex)
+
+	log "github.com/sirupsen/logrus"
+
+	"github.com/bitly/go-simplejson"
+	"github.com/go-resty/resty/v2"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/infra/conf"
+
+	"github.com/XrayR-project/XrayR/api"
+)
+
+// APIClient create an api client to the panel.
+type APIClient struct {
+	client        *resty.Client
+	APIHost       string
+	NodeID        int
+	Key           string
+	NodeType      string
+	EnableVless   bool
+	VlessFlow     string
+	SpeedLimit    float64
+	DeviceLimit   int
+	LocalRuleList []api.DetectRule
+	resp          atomic.Value
+	eTags         map[string]string
+	// === 新增字段开始 ===
+    lastReportOnline map[int]int // 用于存储本地上报的在线用户数
+    access           sync.Mutex  // 用于并发安全的互斥锁
+    // === 新增字段结束 ===
+}
+
+// New create an api instance
+func New(apiConfig *api.Config) *APIClient {
+	client := resty.New()
+	client.SetRetryCount(3)
+	if apiConfig.Timeout > 0 {
+		client.SetTimeout(time.Duration(apiConfig.Timeout) * time.Second)
+	} else {
+		client.SetTimeout(5 * time.Second)
+	}
+	client.OnError(func(req *resty.Request, err error) {
+		if v, ok := err.(*resty.ResponseError); ok {
+			// v.Response contains the last response from the server
+			// v.Err contains the original error
+			log.Print(v.Err)
+		}
+	})
+	client.SetBaseURL(apiConfig.APIHost)
+
+	var nodeType string
+
+	if apiConfig.NodeType == "V2ray" && apiConfig.EnableVless {
+		nodeType = "vless"
+	} else {
+		nodeType = strings.ToLower(apiConfig.NodeType)
+	}
+	// Create Key for each requests
+	client.SetQueryParams(map[string]string{
+		"node_id":   strconv.Itoa(apiConfig.NodeID),
+		"node_type": nodeType,
+		"token":     apiConfig.Key,
+	})
+	// Read local rule list
+	localRuleList := readLocalRuleList(apiConfig.RuleListPath)
+	apiClient := &APIClient{
+		client:        client,
+		NodeID:        apiConfig.NodeID,
+		Key:           apiConfig.Key,
+		APIHost:       apiConfig.APIHost,
+		NodeType:      apiConfig.NodeType,
+		EnableVless:   apiConfig.EnableVless,
+		VlessFlow:     apiConfig.VlessFlow,
+		SpeedLimit:    apiConfig.SpeedLimit,
+		DeviceLimit:   apiConfig.DeviceLimit,
+		LocalRuleList: localRuleList,
+		eTags:         make(map[string]string),
+		// === 新增初始化开始 ===
+        lastReportOnline: make(map[int]int), // 初始化 map
+        // `access` 字段是 sync.Mutex，零值即可使用，无需显式初始化。
+        // === 新增初始化结束 ===
+	}
+	return apiClient
+}
+
+// readLocalRuleList reads the local rule list file
+func readLocalRuleList(path string) (LocalRuleList []api.DetectRule) {
+	LocalRuleList = make([]api.DetectRule, 0)
+
+	if path != "" {
+		// open the file
+		file, err := os.Open(path)
+		defer file.Close()
+		// handle errors while opening
+		if err != nil {
+			log.Printf("Error when opening file: %s", err)
+			return LocalRuleList
+		}
+
+		fileScanner := bufio.NewScanner(file)
+
+		// read line by line
+		for fileScanner.Scan() {
+			LocalRuleList = append(LocalRuleList, api.DetectRule{
+				ID:      -1,
+				Pattern: regexp.MustCompile(fileScanner.Text()),
+			})
+		}
+		// handle first encountered error while reading
+		if err := fileScanner.Err(); err != nil {
+			log.Fatalf("Error while reading file: %s", err)
+			return
+		}
+	}
+
+	return LocalRuleList
+}
+
+// Describe return a description of the client
+func (c *APIClient) Describe() api.ClientInfo {
+	return api.ClientInfo{APIHost: c.APIHost, NodeID: c.NodeID, Key: c.Key, NodeType: c.NodeType}
+}
+
+// Debug set the client debug for client
+func (c *APIClient) Debug() {
+	c.client.SetDebug(true)
+}
+
+func (c *APIClient) assembleURL(path string) string {
+	return c.APIHost + path
+}
+
+func (c *APIClient) parseResponse(res *resty.Response, path string, err error) (*simplejson.Json, error) {
+	if err != nil {
+		return nil, fmt.Errorf("request %s failed: %v", c.assembleURL(path), err)
+	}
+
+	if res.StatusCode() > 399 {
+		return nil, fmt.Errorf("request %s failed: %s, %v", c.assembleURL(path), res.String(), err)
+	}
+
+	rtn, err := simplejson.NewJson(res.Body())
+	if err != nil {
+		return nil, fmt.Errorf("ret %s invalid", res.String())
+	}
+
+	return rtn, nil
+}
+
+// GetNodeInfo will pull NodeInfo Config from panel
+func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
+	server := new(serverConfig)
+	path := "/api/v1/server/UniProxy/config"
+
+	res, err := c.client.R().
+		SetHeader("If-None-Match", c.eTags["node"]).
+		ForceContentType("application/json").
+		Get(path)
+
+	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
+	if res.StatusCode() == 304 {
+		return nil, errors.New(api.NodeNotModified)
+	}
+	// update etag
+	if res.Header().Get("Etag") != "" && res.Header().Get("Etag") != c.eTags["node"] {
+		c.eTags["node"] = res.Header().Get("Etag")
+	}
+
+	nodeInfoResp, err := c.parseResponse(res, path, err)
+	if err != nil {
+		return nil, err
+	}
+	b, _ := nodeInfoResp.Encode()
+	json.Unmarshal(b, server)
+
+	if server.ServerPort == 0 {
+		return nil, errors.New("server port must > 0")
+	}
+
+	c.resp.Store(server)
+
+	switch c.NodeType {
+	case "V2ray", "Vmess", "Vless":
+		nodeInfo, err = c.parseV2rayNodeResponse(server)
+	case "Trojan":
+		nodeInfo, err = c.parseTrojanNodeResponse(server)
+	case "Shadowsocks":
+		nodeInfo, err = c.parseSSNodeResponse(server)
+	default:
+		return nil, fmt.Errorf("unsupported node type: %s", c.NodeType)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("parse node info failed: %s, \nError: %v", res.String(), err)
+	}
+
+	return nodeInfo, nil
+}
+
+// GetUserList will pull user form panel
+func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
+    var users []*user
+    path := "/api/v1/server/UniProxy/user"
+
+    res, err := c.client.R().
+        SetHeader("If-None-Match", c.eTags["users"]).
+        ForceContentType("application/json").
+        Get(path)
+
+    if res.StatusCode() == 304 {
+        return nil, errors.New(api.UserNotModified)
+    }
+    
+    if res.Header().Get("Etag") != "" && res.Header().Get("Etag") != c.eTags["users"] {
+        c.eTags["users"] = res.Header().Get("Etag")
+    }
+
+    usersResp, err := c.parseResponse(res, path, err)
+    if err != nil {
+        return nil, err
+    }
+    
+    b, _ := usersResp.Get("users").Encode()
+    json.Unmarshal(b, &users)
+    if len(users) == 0 {
+        return nil, errors.New("users is null")
+    }
+
+    // 【关键修复】从面板获取有设备限制的用户的当前在线设备数
+    // 用于初始化设备限制计数器
+    panelOnlineDevices := make(map[int]int)
+    if c.DeviceLimit > 0 {
+        // 获取有设备限制的用户的当前在线设备数
+        aliveList, err := c.getAliveListFromPanel()
+        if err != nil {
+            log.Printf("警告：获取在线设备列表失败，设备限制可能不准确。错误：%v", err)
+        } else {
+            panelOnlineDevices = aliveList
+        }
+    }
+
+    userList := make([]api.UserInfo, 0, len(users))
+    
+    for i := 0; i < len(users); i++ {
+        u := api.UserInfo{
+            UID:  users[i].Id,
+            UUID: users[i].Uuid,
+        }
+
+        // 速度限制
+        if c.SpeedLimit > 0 {
+            u.SpeedLimit = uint64(c.SpeedLimit * 1000000 / 8)
+        } else {
+            u.SpeedLimit = uint64(users[i].SpeedLimit * 1000000 / 8)
+        }
+
+        // 【关键修复】设备限制逻辑
+        // 1. 优先使用节点全局设备限制
+        deviceLimit := c.DeviceLimit
+        
+        // 2. 如果用户有特定的设备限制，使用用户的
+        // 注意：Xboard可能在返回的用户数据中包含device_limit字段
+        // 如果没有，则使用节点全局限制
+        
+        // 3. 计算剩余可用设备数
+        currentOnline := 0
+        if count, exists := panelOnlineDevices[users[i].Id]; exists {
+            currentOnline = count
+        }
+        
+        // 如果设备限制>0，计算剩余设备数
+        if deviceLimit > 0 {
+            remainingDevices := deviceLimit - currentOnline
+            if remainingDevices <= 0 {
+                // 没有可用设备，跳过此用户
+                continue
+            }
+            u.DeviceLimit = remainingDevices
+        } else {
+            u.DeviceLimit = 0 // 0表示无限制
+        }
+
+        u.Email = u.UUID + "@v2board.user"
+        if c.NodeType == "Shadowsocks" {
+            u.Passwd = u.UUID
+        }
+        
+        userList = append(userList, u)
+    }
+
+    if len(userList) == 0 {
+        return nil, errors.New("经过设备限制检查后，无可用用户")
+    }
+
+    return &userList, nil
+}
+
+// 【新增】从面板获取在线设备列表（简化版）
+func (c *APIClient) getAliveListFromPanel() (map[int]int, error) {
+    path := "/api/v1/server/UniProxy/alivelist"
+    
+    res, err := c.client.R().
+        SetQueryParams(map[string]string{
+            "node_id":   strconv.Itoa(c.NodeID),
+            "node_type": strings.ToLower(c.NodeType),
+            "token":     c.Key,
+        }).
+        ForceContentType("application/json").
+        Get(path)
+
+    if err != nil {
+        return nil, fmt.Errorf("获取在线设备列表失败: %v", err)
+    }
+    if res.StatusCode() > 399 {
+        return nil, fmt.Errorf("面板返回错误 (HTTP %d): %s", res.StatusCode(), res.String())
+    }
+
+    // 解析响应，格式为 {"alive": {"用户ID1": 数量, "用户ID2": 数量}}
+    var result struct {
+        Alive map[int]int `json:"alive"`
+    }
+    
+    if err := json.Unmarshal(res.Body(), &result); err != nil {
+        return nil, fmt.Errorf("解析在线设备列表响应失败: %v", err)
+    }
+    
+    return result.Alive, nil
+}
+
+// ReportUserTraffic reports the user traffic
+func (c *APIClient) ReportUserTraffic(userTraffic *[]api.UserTraffic) error {
+	path := "/api/v1/server/UniProxy/push"
+
+	// json structure: {uid1: [u, d], uid2: [u, d], uid1: [u, d], uid3: [u, d]}
+	data := make(map[int][]int64, len(*userTraffic))
+	for _, traffic := range *userTraffic {
+		data[traffic.UID] = []int64{traffic.Upload, traffic.Download}
+	}
+
+	res, err := c.client.R().SetBody(data).ForceContentType("application/json").Post(path)
+	_, err = c.parseResponse(res, path, err)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// GetNodeRule implements the API interface
+func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
+	routes := c.resp.Load().(*serverConfig).Routes
+
+	ruleList := c.LocalRuleList
+
+	for i := range routes {
+		if routes[i].Action == "block" {
+			ruleList = append(ruleList, api.DetectRule{
+				ID:      i,
+				Pattern: regexp.MustCompile(strings.Join(routes[i].Match, "|")),
+			})
+		}
+	}
+
+	return &ruleList, nil
+}
+
+// ReportNodeStatus implements the API interface
+func (c *APIClient) ReportNodeStatus(nodeStatus *api.NodeStatus) (err error) {
+    // 【关键修复】按照Xboard的/status接口期望的格式构建数据
+    // 注意：Xboard期望的是具体的字节数，不是百分比
+    estimatedMemTotal := int64(4 * 1024 * 1024 * 1024)   // 4 GB
+    estimatedDiskTotal := int64(40 * 1024 * 1024 * 1024) // 40 GB
+    
+    statusData := map[string]interface{}{
+        "cpu": nodeStatus.CPU,
+        "mem": map[string]int64{
+            "total": estimatedMemTotal,
+            "used":  int64((nodeStatus.Mem / 100.0) * float64(estimatedMemTotal)),
+        },
+        "swap": map[string]int64{
+            "total": 0, // 如果没有交换空间信息，上报0
+            "used":  0,
+        },
+        "disk": map[string]int64{
+            "total": estimatedDiskTotal,
+            "used":  int64((nodeStatus.Disk / 100.0) * float64(estimatedDiskTotal)),
+        },
+    }
+    
+    path := "/api/v1/server/UniProxy/status"
+    
+    res, err := c.client.R().
+        SetQueryParams(map[string]string{
+            "node_id":   strconv.Itoa(c.NodeID),
+            "node_type": strings.ToLower(c.NodeType),
+            "token":     c.Key,
+        }).
+        SetBody(statusData).
+        ForceContentType("application/json").
+        Post(path)
+
+    if err != nil {
+        return fmt.Errorf("上报节点状态失败: %v", err)
+    }
+    if res.StatusCode() > 399 {
+        return fmt.Errorf("面板返回错误 (HTTP %d): %s", res.StatusCode(), res.String())
+    }
+    
+    return nil
+}
+
+// ReportNodeOnlineUsers implements the API interface
+func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) error {
+    c.access.Lock()
+    defer c.access.Unlock()
+
+    // 【关键修复】按照Xboard期望的格式构建数据
+    // Xboard期望：{"用户ID1": ["IP1", "IP2"], "用户ID2": ["IP3"]}
+    onlineData := make(map[int][]string)
+    
+    for _, user := range *onlineUserList {
+        // 确保每个用户ID对应的值是一个字符串数组
+        onlineData[user.UID] = append(onlineData[user.UID], user.IP)
+    }
+    
+    // 如果没有任何在线用户，也上报空对象
+    if len(onlineData) == 0 {
+        onlineData = make(map[int][]string)
+    }
+    
+    path := "/api/v1/server/UniProxy/alive"
+    
+    // 【修复】正确设置请求参数
+    res, err := c.client.R().
+        SetQueryParams(map[string]string{
+            "node_id":   strconv.Itoa(c.NodeID),
+            "node_type": strings.ToLower(c.NodeType),
+            "token":     c.Key,
+        }).
+        SetBody(onlineData).
+        ForceContentType("application/json").
+        Post(path)
+
+    if err != nil {
+        return fmt.Errorf("上报在线用户失败: %v", err)
+    }
+    if res.StatusCode() > 399 {
+        return fmt.Errorf("面板返回错误 (HTTP %d): %s", res.StatusCode(), res.String())
+    }
+    
+    // 【新增】更新本地记录，用于下一次GetUserList时的设备限制计算
+    for uid, ips := range onlineData {
+        c.lastReportOnline[uid] = len(ips)
+    }
+    
+    log.Printf("成功上报 %d 个用户的在线数据，总计 %d 个IP", len(onlineData), len(*onlineUserList))
+    return nil
+}
+
+func (c *APIClient) FetchNodeOnlineUsers() (map[int]int, error) {
+    path := "/api/v1/server/UniProxy/alivelist"
+    
+    // 【关键修复】添加查询参数
+    res, err := c.client.R().
+        SetQueryParams(map[string]string{
+            "node_id":   strconv.Itoa(c.NodeID),
+            "node_type": strings.ToLower(c.NodeType),
+            "token":     c.Key,
+        }).
+        ForceContentType("application/json").
+        Get(path)
+
+    if err != nil {
+        return nil, fmt.Errorf("获取在线列表失败: %v", err)
+    }
+    if res.StatusCode() > 399 {
+        return nil, fmt.Errorf("面板返回错误 (HTTP %d): %s", res.StatusCode(), res.String())
+    }
+
+    // 解析响应，格式应为 {"alive": {"用户ID1": 数量, "用户ID2": 数量}}
+    var result struct {
+        Alive map[int]int `json:"alive"`
+    }
+    if err := json.Unmarshal(res.Body(), &result); err != nil {
+        return nil, fmt.Errorf("解析在线列表响应失败: %v", err)
+    }
+    
+    log.Printf("从面板获取到 %d 个在线用户数据", len(result.Alive))
+    return result.Alive, nil
+}
+
+// ReportIllegal implements the API interface
+func (c *APIClient) ReportIllegal(detectResultList *[]api.DetectResult) error {
+	return nil
+}
+
+// parseTrojanNodeResponse parse the response for the given nodeInfo format
+func (c *APIClient) parseTrojanNodeResponse(s *serverConfig) (*api.NodeInfo, error) {
+	// Create GeneralNodeInfo
+	nodeInfo := &api.NodeInfo{
+		NodeType:          c.NodeType,
+		NodeID:            c.NodeID,
+		Port:              uint32(s.ServerPort),
+		TransportProtocol: "tcp",
+		EnableTLS:         true,
+		Host:              s.Host,
+		ServiceName:       s.ServerName,
+		NameServerConfig:  s.parseDNSConfig(),
+	}
+	return nodeInfo, nil
+}
+
+// parseSSNodeResponse parse the response for the given nodeInfo format
+func (c *APIClient) parseSSNodeResponse(s *serverConfig) (*api.NodeInfo, error) {
+	var header json.RawMessage
+
+	if s.Obfs == "http" {
+		path := "/"
+		if p := s.ObfsSettings.Path; p != "" {
+			if strings.HasPrefix(p, "/") {
+				path = p
+			} else {
+				path += p
+			}
+		}
+		h := simplejson.New()
+		h.Set("type", "http")
+		h.SetPath([]string{"request", "path"}, path)
+		header, _ = h.Encode()
+	}
+	// Create GeneralNodeInfo
+	return &api.NodeInfo{
+		NodeType:          c.NodeType,
+		NodeID:            c.NodeID,
+		Port:              uint32(s.ServerPort),
+		TransportProtocol: "tcp",
+		CypherMethod:      s.Cipher,
+		ServerKey:         s.ServerKey, // shadowsocks2022 share key
+		NameServerConfig:  s.parseDNSConfig(),
+		Header:            header,
+	}, nil
+}
+
+// parseV2rayNodeResponse parse the response for the given nodeInfo format
+func (c *APIClient) parseV2rayNodeResponse(s *serverConfig) (*api.NodeInfo, error) {
+	var (
+		host          string
+		header        json.RawMessage
+		enableTLS     bool
+		enableREALITY bool
+		dest          string
+		xVer          uint64
+	)
+
+	if s.VlessTlsSettings.Dest != "" {
+		dest = s.VlessTlsSettings.Dest
+	} else {
+		dest = s.VlessTlsSettings.Sni
+	}
+	if s.VlessTlsSettings.xVer != 0 {
+		xVer = s.VlessTlsSettings.xVer
+	} else {
+		xVer = 0
+	}
+
+	realityConfig := api.REALITYConfig{
+		Dest:             dest + ":" + s.VlessTlsSettings.ServerPort,
+		ProxyProtocolVer: xVer,
+		ServerNames:      []string{s.VlessTlsSettings.Sni},
+		PrivateKey:       s.VlessTlsSettings.PrivateKey,
+		ShortIds:         []string{s.VlessTlsSettings.ShortId},
+	}
+
+	if c.EnableVless {
+		s.NetworkSettings = s.VlessNetworkSettings
+	}
+
+	switch s.Network {
+	case "ws":
+		if s.NetworkSettings.Headers != nil {
+			if httpHeader, err := s.NetworkSettings.Headers.MarshalJSON(); err != nil {
+				return nil, err
+			} else {
+				b, _ := simplejson.NewJson(httpHeader)
+				host = b.Get("Host").MustString()
+			}
+		}
+	case "tcp":
+		if s.NetworkSettings.Header != nil {
+			if httpHeader, err := s.NetworkSettings.Header.MarshalJSON(); err != nil {
+				return nil, err
+			} else {
+				header = httpHeader
+			}
+		}
+	case "httpupgrade", "splithttp":
+		if s.NetworkSettings.Headers != nil {
+			if httpHeaders, err := s.NetworkSettings.Headers.MarshalJSON(); err != nil {
+				return nil, err
+			} else {
+				b, _ := simplejson.NewJson(httpHeaders)
+				host = b.Get("Host").MustString()
+			}
+		}
+		if s.NetworkSettings.Host != "" {
+			host = s.NetworkSettings.Host
+		}
+	}
+
+	switch s.Tls {
+	case 0:
+		enableTLS = false
+		enableREALITY = false
+	case 1:
+		enableTLS = true
+		enableREALITY = false
+	case 2:
+		enableTLS = true
+		enableREALITY = true
+	}
+
+	// Create GeneralNodeInfo
+	return &api.NodeInfo{
+		NodeType:          c.NodeType,
+		NodeID:            c.NodeID,
+		Port:              uint32(s.ServerPort),
+		AlterID:           0,
+		TransportProtocol: s.Network,
+		EnableTLS:         enableTLS,
+		Path:              s.NetworkSettings.Path,
+		Host:              host,
+		EnableVless:       c.EnableVless,
+		VlessFlow:         s.VlessFlow,
+		ServiceName:       s.NetworkSettings.ServiceName,
+		Header:            header,
+		EnableREALITY:     enableREALITY,
+		REALITYConfig:     &realityConfig,
+		NameServerConfig:  s.parseDNSConfig(),
+	}, nil
+}
+
+func (s *serverConfig) parseDNSConfig() (nameServerList []*conf.NameServerConfig) {
+	for i := range s.Routes {
+		if s.Routes[i].Action == "dns" {
+			nameServerList = append(nameServerList, &conf.NameServerConfig{
+				Address: &conf.Address{Address: net.ParseAddress(s.Routes[i].ActionValue)},
+				Domains: s.Routes[i].Match,
+			})
+		}
+	}
+
+	return
+}
