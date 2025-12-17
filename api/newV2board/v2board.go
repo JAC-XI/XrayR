@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-	 "sync" // 新增，用于支持 APIClient 中的互斥锁 (sync.Mutex)
+	 "sync"
 
 	log "github.com/sirupsen/logrus"
 
@@ -37,10 +37,8 @@ type APIClient struct {
 	LocalRuleList []api.DetectRule
 	resp          atomic.Value
 	eTags         map[string]string
-	// === 新增字段开始 ===
-    lastReportOnline map[int]int // 用于存储本地上报的在线用户数
-    access           sync.Mutex  // 用于并发安全的互斥锁
-    // === 新增字段结束 ===
+    lastReportOnline map[int]int 
+    access           sync.Mutex 
 }
 
 // New create an api instance
@@ -88,10 +86,7 @@ func New(apiConfig *api.Config) *APIClient {
 		DeviceLimit:   apiConfig.DeviceLimit,
 		LocalRuleList: localRuleList,
 		eTags:         make(map[string]string),
-		// === 新增初始化开始 ===
-        lastReportOnline: make(map[int]int), // 初始化 map
-        // `access` 字段是 sync.Mutex，零值即可使用，无需显式初始化。
-        // === 新增初始化结束 ===
+        lastReportOnline: make(map[int]int), 
 	}
 	return apiClient
 }
@@ -239,11 +234,8 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
         return nil, errors.New("users is null")
     }
 
-    // 【关键修复】从面板获取有设备限制的用户的当前在线设备数
-    // 用于初始化设备限制计数器
     panelOnlineDevices := make(map[int]int)
     if c.DeviceLimit > 0 {
-        // 获取有设备限制的用户的当前在线设备数
         aliveList, err := c.getAliveListFromPanel()
         if err != nil {
             log.Printf("警告：获取在线设备列表失败，设备限制可能不准确。错误：%v", err)
@@ -260,37 +252,26 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
             UUID: users[i].Uuid,
         }
 
-        // 速度限制
         if c.SpeedLimit > 0 {
             u.SpeedLimit = uint64(c.SpeedLimit * 1000000 / 8)
         } else {
             u.SpeedLimit = uint64(users[i].SpeedLimit * 1000000 / 8)
         }
 
-        // 【关键修复】设备限制逻辑
-        // 1. 优先使用节点全局设备限制
         deviceLimit := c.DeviceLimit
         
-        // 2. 如果用户有特定的设备限制，使用用户的
-        // 注意：Xboard可能在返回的用户数据中包含device_limit字段
-        // 如果没有，则使用节点全局限制
-        
-        // 3. 计算剩余可用设备数
         currentOnline := 0
         if count, exists := panelOnlineDevices[users[i].Id]; exists {
             currentOnline = count
         }
-        
-        // 如果设备限制>0，计算剩余设备数
         if deviceLimit > 0 {
             remainingDevices := deviceLimit - currentOnline
             if remainingDevices <= 0 {
-                // 没有可用设备，跳过此用户
                 continue
             }
             u.DeviceLimit = remainingDevices
         } else {
-            u.DeviceLimit = 0 // 0表示无限制
+            u.DeviceLimit = 0 
         }
 
         u.Email = u.UUID + "@v2board.user"
@@ -308,7 +289,6 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
     return &userList, nil
 }
 
-// 【新增】从面板获取在线设备列表（简化版）
 func (c *APIClient) getAliveListFromPanel() (map[int]int, error) {
     path := "/api/v1/server/UniProxy/alivelist"
     
@@ -328,7 +308,6 @@ func (c *APIClient) getAliveListFromPanel() (map[int]int, error) {
         return nil, fmt.Errorf("面板返回错误 (HTTP %d): %s", res.StatusCode(), res.String())
     }
 
-    // 解析响应，格式为 {"alive": {"用户ID1": 数量, "用户ID2": 数量}}
     var result struct {
         Alive map[int]int `json:"alive"`
     }
@@ -379,8 +358,6 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 
 // ReportNodeStatus implements the API interface
 func (c *APIClient) ReportNodeStatus(nodeStatus *api.NodeStatus) (err error) {
-    // 【关键修复】按照Xboard的/status接口期望的格式构建数据
-    // 注意：Xboard期望的是具体的字节数，不是百分比
     estimatedMemTotal := int64(2 * 1024 * 1024 * 1024)   // 2 GB
     estimatedDiskTotal := int64(40 * 1024 * 1024 * 1024) // 40 GB
     
@@ -391,7 +368,7 @@ func (c *APIClient) ReportNodeStatus(nodeStatus *api.NodeStatus) (err error) {
             "used":  int64((nodeStatus.Mem / 100.0) * float64(estimatedMemTotal)),
         },
         "swap": map[string]int64{
-            "total": 0, // 如果没有交换空间信息，上报0
+            "total": 0, 
             "used":  0,
         },
         "disk": map[string]int64{
@@ -427,23 +404,18 @@ func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) erro
     c.access.Lock()
     defer c.access.Unlock()
 
-    // 【关键修复】按照Xboard期望的格式构建数据
-    // Xboard期望：{"用户ID1": ["IP1", "IP2"], "用户ID2": ["IP3"]}
     onlineData := make(map[int][]string)
     
     for _, user := range *onlineUserList {
-        // 确保每个用户ID对应的值是一个字符串数组
         onlineData[user.UID] = append(onlineData[user.UID], user.IP)
     }
     
-    // 如果没有任何在线用户，也上报空对象
     if len(onlineData) == 0 {
         onlineData = make(map[int][]string)
     }
     
     path := "/api/v1/server/UniProxy/alive"
     
-    // 【修复】正确设置请求参数
     res, err := c.client.R().
         SetQueryParams(map[string]string{
             "node_id":   strconv.Itoa(c.NodeID),
@@ -461,7 +433,6 @@ func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) erro
         return fmt.Errorf("面板返回错误 (HTTP %d): %s", res.StatusCode(), res.String())
     }
     
-    // 【新增】更新本地记录，用于下一次GetUserList时的设备限制计算
     for uid, ips := range onlineData {
         c.lastReportOnline[uid] = len(ips)
     }
@@ -473,7 +444,6 @@ func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) erro
 func (c *APIClient) FetchNodeOnlineUsers() (map[int]int, error) {
     path := "/api/v1/server/UniProxy/alivelist"
     
-    // 【关键修复】添加查询参数
     res, err := c.client.R().
         SetQueryParams(map[string]string{
             "node_id":   strconv.Itoa(c.NodeID),
@@ -490,7 +460,6 @@ func (c *APIClient) FetchNodeOnlineUsers() (map[int]int, error) {
         return nil, fmt.Errorf("面板返回错误 (HTTP %d): %s", res.StatusCode(), res.String())
     }
 
-    // 解析响应，格式应为 {"alive": {"用户ID1": 数量, "用户ID2": 数量}}
     var result struct {
         Alive map[int]int `json:"alive"`
     }
